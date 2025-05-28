@@ -873,6 +873,26 @@ function cleanRequestHeaders(originalHeaders, targetUrl) {
   // 设置正确的目标服务器信息
   cleanedHeaders.set('Host', targetUrl.hostname);
   
+  // 清除所有可能暴露真实IP的头部
+  cleanedHeaders.delete('CF-Connecting-IP');
+  cleanedHeaders.delete('CF-IPCountry');
+  cleanedHeaders.delete('CF-Ray');
+  cleanedHeaders.delete('CF-Visitor');
+  cleanedHeaders.delete('X-Forwarded-Proto');
+  cleanedHeaders.delete('X-Forwarded-For');
+  cleanedHeaders.delete('X-Real-IP');
+  cleanedHeaders.delete('X-Forwarded-Host');
+  cleanedHeaders.delete('X-Original-Host');
+  cleanedHeaders.delete('Forwarded');
+  cleanedHeaders.delete('True-Client-IP');
+  cleanedHeaders.delete('X-Client-IP');
+  cleanedHeaders.delete('X-Cluster-Client-IP');
+  
+  // 设置通用的用户代理，避免暴露Worker特征
+  if (!cleanedHeaders.has('User-Agent')) {
+    cleanedHeaders.set('User-Agent', 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36');
+  }
+  
   // 如果原始请求有 Origin，则更新为目标域名
   if (originalHeaders.has('Origin')) {
     cleanedHeaders.set('Origin', targetUrl.origin);
@@ -890,6 +910,18 @@ function cleanRequestHeaders(originalHeaders, targetUrl) {
       cleanedHeaders.delete('Referer');
     }
   }
+  
+  // 设置接受编码，优化传输
+  if (!cleanedHeaders.has('Accept-Encoding')) {
+    cleanedHeaders.set('Accept-Encoding', 'gzip, deflate, br');
+  }
+  
+  // 设置连接类型
+  cleanedHeaders.set('Connection', 'keep-alive');
+  
+  // 移除可能导致问题的缓存控制头（让目标服务器决定）
+  cleanedHeaders.delete('Cache-Control');
+  cleanedHeaders.delete('Pragma');
   
   return cleanedHeaders;
 }
