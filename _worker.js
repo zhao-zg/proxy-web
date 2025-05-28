@@ -1,20 +1,31 @@
 /**
- * Cloudflare Worker 反向代理服务 - 优化版
+ * Cloudflare Worker 反向代理服务 - 内容重写优化版
  * 功能：将 aaa--bb--com.yourdomain.com 的请求代理到 aaa.bb.com
- * 当访问 proxy.yourdomain.com 时显示前端页面
- * 优化：完全隐藏源IP，智能URL处理
+ * 优化：自动替换响应内容中的绝对地址为代理地址
  */
 
 // 配置常量
 const CONFIG = {
-  REQUEST_TIMEOUT: 45000, // 30秒超时
+  REQUEST_TIMEOUT: 45000,
   MAX_REDIRECTS: 45,
   CORS_MAX_AGE: '86400',
   ALLOWED_METHODS: ['GET', 'POST', 'PUT', 'DELETE', 'PATCH', 'HEAD', 'OPTIONS'],
   
-  // 扩展的敏感头部列表 - 防止IP泄露
+  // 需要重写内容的响应类型
+  REWRITABLE_CONTENT_TYPES: [
+    'text/html',
+    'text/css',
+    'text/javascript',
+    'application/javascript',
+    'application/x-javascript',
+    'application/json',
+    'text/xml',
+    'application/xml',
+    'application/xhtml+xml'
+  ],
+  
+  // 扩展的敏感头部列表
   BLOCKED_HEADERS: [
-    // Cloudflare 特定头部
     'cf-connecting-ip',
     'cf-ipcountry', 
     'cf-ray',
@@ -22,8 +33,6 @@ const CONFIG = {
     'cf-request-id',
     'cf-warp-tag-id',
     'cf-worker',
-    
-    // 代理和转发头部
     'x-forwarded-proto',
     'x-forwarded-for',
     'x-forwarded-host',
@@ -34,8 +43,6 @@ const CONFIG = {
     'x-forwarded',
     'forwarded-for',
     'forwarded',
-    
-    // 其他可能暴露信息的头部
     'via',
     'x-proxy-authorization',
     'proxy-authorization',
@@ -69,7 +76,6 @@ addEventListener('fetch', event => {
  */
 async function handleRequest(request) {
   try {
-    // 解析请求URL
     const url = new URL(request.url);
     const hostname = url.hostname;
     const hostParts = hostname.split('.');
@@ -81,17 +87,14 @@ async function handleRequest(request) {
     
     const subdomain = extractSubdomain(hostname);
     
-    // 验证子域名
     if (!subdomain) {
       return createErrorResponse('Invalid subdomain format', 400);
     }
     
-    // 验证请求方法
     if (!CONFIG.ALLOWED_METHODS.includes(request.method)) {
       return createErrorResponse('Method not allowed', 405);
     }
     
-    // 处理 OPTIONS 预检请求
     if (request.method === 'OPTIONS') {
       return handleOptions(request);
     }
@@ -109,6 +112,501 @@ async function handleRequest(request) {
 }
 
 /**
+ * 执行代理请求 - 增强内容重写功能
+ * @param {Request} originalRequest - 原始请求
+ * @param {URL} targetUrl - 目标URL
+ * @returns {Promise<Response>} - 代理响应
+ */
+async function proxyRequest(originalRequest, targetUrl) {
+  const requestOptions = {
+    method: originalRequest.method,
+    headers: cleanRequestHeaders(originalRequest.headers, targetUrl),
+    redirect: 'manual',
+    signal: AbortSignal.timeout(CONFIG.REQUEST_TIMEOUT)
+  };
+  
+  if (!['GET', 'HEAD'].includes(originalRequest.method)) {
+    requestOptions.body = originalRequest.body;
+  }
+  
+  try {
+    const response = await fetch(targetUrl.toString(), requestOptions);
+    
+    // 处理重定向
+    if (response.status >= 300 && response.status < 400) {
+      return handleRedirect(response, originalRequest);
+    }
+    
+    // 创建代理响应并处理内容重写
+    return await createProxyResponseWithRewrite(response, originalRequest, targetUrl);
+    
+  } catch (error) {
+    if (error.name === 'TimeoutError') {
+      return createErrorResponse('Request timeout', 504);
+    }
+    throw error;
+  }
+}
+
+/**
+ * 创建代理响应并重写内容
+ * @param {Response} originalResponse - 原始响应
+ * @param {Request} originalRequest - 原始请求
+ * @param {URL} targetUrl - 目标URL
+ * @returns {Promise<Response>} - 处理后的响应
+ */
+async function createProxyResponseWithRewrite(originalResponse, originalRequest, targetUrl) {
+  const contentType = originalResponse.headers.get('content-type') || '';
+  const shouldRewrite = shouldRewriteContent(contentType);
+  
+  // 如果不需要重写内容，直接返回
+  if (!shouldRewrite) {
+    return createProxyResponse(originalResponse);
+  }
+  
+  // 读取响应内容
+  const originalText = await originalResponse.text();
+  
+  // 重写内容中的URL
+  const rewrittenText = rewriteContent(
+    originalText, 
+    contentType, 
+    targetUrl, 
+    originalRequest.url
+  );
+  
+  // 创建新的响应
+  const newResponse = new Response(rewrittenText, {
+    status: originalResponse.status,
+    statusText: originalResponse.statusText,
+    headers: originalResponse.headers
+  });
+  
+  // 添加CORS头和清理敏感头部
+  addCorsHeaders(newResponse.headers);
+  cleanResponseHeaders(newResponse.headers);
+  
+  return newResponse;
+}
+
+/**
+ * 判断是否需要重写内容
+ * @param {string} contentType - 内容类型
+ * @returns {boolean} - 是否需要重写
+ */
+function shouldRewriteContent(contentType) {
+  if (!contentType) return false;
+  
+  const lowerContentType = contentType.toLowerCase();
+  return CONFIG.REWRITABLE_CONTENT_TYPES.some(type => 
+    lowerContentType.includes(type)
+  );
+}
+
+/**
+ * 重写内容中的URL
+ * @param {string} content - 原始内容
+ * @param {string} contentType - 内容类型
+ * @param {URL} targetUrl - 目标URL
+ * @param {string} proxyUrl - 代理URL
+ * @returns {string} - 重写后的内容
+ */
+function rewriteContent(content, contentType, targetUrl, proxyUrl) {
+  const proxyUrlObj = new URL(proxyUrl);
+  const proxyDomain = proxyUrlObj.hostname.split('.').slice(1).join('.');
+  
+  // 根据内容类型选择重写策略
+  if (contentType.includes('html')) {
+    return rewriteHtml(content, targetUrl, proxyDomain);
+  } else if (contentType.includes('css')) {
+    return rewriteCss(content, targetUrl, proxyDomain);
+  } else if (contentType.includes('javascript')) {
+    return rewriteJavaScript(content, targetUrl, proxyDomain);
+  } else if (contentType.includes('json')) {
+    return rewriteJson(content, targetUrl, proxyDomain);
+  }
+  
+  // 默认使用通用重写
+  return rewriteGeneric(content, targetUrl, proxyDomain);
+}
+
+/**
+ * 重写HTML内容
+ * @param {string} html - HTML内容
+ * @param {URL} targetUrl - 目标URL
+ * @param {string} proxyDomain - 代理域名
+ * @returns {string} - 重写后的HTML
+ */
+function rewriteHtml(html, targetUrl, proxyDomain) {
+  const patterns = [
+    // href 属性
+    {
+      regex: /(<[^>]+\s+href\s*=\s*["'])([^"']*)(["'])/gi,
+      handler: (match, prefix, url, suffix) => {
+        const rewrittenUrl = rewriteUrl(url, targetUrl, proxyDomain);
+        return prefix + rewrittenUrl + suffix;
+      }
+    },
+    // src 属性
+    {
+      regex: /(<[^>]+\s+src\s*=\s*["'])([^"']*)(["'])/gi,
+      handler: (match, prefix, url, suffix) => {
+        const rewrittenUrl = rewriteUrl(url, targetUrl, proxyDomain);
+        return prefix + rewrittenUrl + suffix;
+      }
+    },
+    // action 属性（form 标签）
+    {
+      regex: /(<form[^>]+\s+action\s*=\s*["'])([^"']*)(["'])/gi,
+      handler: (match, prefix, url, suffix) => {
+        const rewrittenUrl = rewriteUrl(url, targetUrl, proxyDomain);
+        return prefix + rewrittenUrl + suffix;
+      }
+    },
+    // srcset 属性（需要特殊处理每个url）
+    {
+      regex: /(<[^>]+\s+srcset\s*=\s*["'])([^"']*)(["'])/gi,
+      handler: (match, prefix, srcset, suffix) => {
+        const rewrittenSrcset = srcset.split(',').map(src => {
+          const [url, descriptor] = src.trim().split(/\s+/);
+          const rewrittenUrl = rewriteUrl(url, targetUrl, proxyDomain);
+          return descriptor ? `${rewrittenUrl} ${descriptor}` : rewrittenUrl;
+        }).join(', ');
+        return prefix + rewrittenSrcset + suffix;
+      }
+    },
+    // style 属性中的 url(...)，这里匹配整个 style 属性的内容，稍后用 CSS 解析或简单替换
+    {
+      regex: /(<[^>]+\s+style\s*=\s*["'])([^"']*)(["'])/gi,
+      handler: (match, prefix, styleContent, suffix) => {
+        const rewrittenStyleContent = styleContent.replace(/url\(\s*(['"]?)([^'")]+)\1\s*\)/gi, (m, quote, url) => {
+          const rewrittenUrl = rewriteUrl(url, targetUrl, proxyDomain);
+          return `url(${quote}${rewrittenUrl}${quote})`;
+        });
+        return prefix + rewrittenStyleContent + suffix;
+      }
+    },
+    // meta 标签的 content 属性中包含 URL（以 http 或 https 开头的）
+    {
+      regex: /(<meta[^>]+\s+content\s*=\s*["'])(https?:\/\/[^"']*)(["'])/gi,
+      handler: (match, prefix, url, suffix) => {
+        const rewrittenUrl = rewriteUrl(url, targetUrl, proxyDomain);
+        return prefix + rewrittenUrl + suffix;
+      }
+    }
+  ];
+
+  let result = html;
+  for (const pattern of patterns) {
+    result = result.replace(pattern.regex, pattern.handler);
+  }
+
+  // 处理内联脚本中的URL
+  result = rewriteInlineScripts(result, targetUrl, proxyDomain);
+
+  return result;
+}
+
+/**
+ * 重写CSS内容
+ * @param {string} css - CSS内容
+ * @param {URL} targetUrl - 目标URL
+ * @param {string} proxyDomain - 代理域名
+ * @returns {string} - 重写后的CSS
+ */
+function rewriteCss(css, targetUrl, proxyDomain) {
+  // 处理 url() 函数
+  css = css.replace(/url\(\s*(['"]?)([^'")]+)\1\s*\)/gi, (match, quote, url) => {
+    const rewrittenUrl = rewriteUrl(url, targetUrl, proxyDomain);
+    return `url(${quote}${rewrittenUrl}${quote})`;
+  });
+
+  // 处理 @import 中的 URL
+  css = css.replace(/@import\s+(['"])([^'"]+)\1/gi, (match, quote, url) => {
+    const rewrittenUrl = rewriteUrl(url, targetUrl, proxyDomain);
+    return `@import ${quote}${rewrittenUrl}${quote}`;
+  });
+
+  
+  return css;
+}
+
+/**
+ * 重写JavaScript内容
+ * @param {string} js - JavaScript内容
+ * @param {URL} targetUrl - 目标URL
+ * @param {string} proxyDomain - 代理域名
+ * @returns {string} - 重写后的JavaScript
+ */
+function rewriteJavaScript(js, targetUrl, proxyDomain) {
+  // 这是一个简化的实现，处理常见的URL模式
+  // 注意：完整的JavaScript重写非常复杂，可能需要AST解析
+  
+  // 处理字符串中的完整URL
+  const urlPattern = /(["'`])(https?:\/\/[^"'`]+)\1/gi;
+  js = js.replace(urlPattern, (match, quote, url) => {
+    try {
+      const urlObj = new URL(url);
+      if (shouldProxyUrl(urlObj, targetUrl)) {
+        const rewrittenUrl = rewriteUrl(url, targetUrl, proxyDomain);
+        return quote + rewrittenUrl + quote;
+      }
+    } catch (e) {
+      // 无效URL忽略
+    }
+    return match;
+  });
+
+  // 处理常用API调用 URL（fetch、XMLHttpRequest等）
+  js = rewriteApiCalls(js, targetUrl, proxyDomain);
+  
+  return js;
+}
+
+/**
+ * 重写API调用
+ * @param {string} js - JavaScript内容
+ * @param {URL} targetUrl - 目标URL
+ * @param {string} proxyDomain - 代理域名
+ * @returns {string} - 重写后的JavaScript
+ */
+function rewriteApiCalls(js, targetUrl, proxyDomain) {
+  // 在脚本开头注入URL重写函数
+  const injectionCode = `
+(function() {
+  const originalFetch = window.fetch;
+  const proxyDomain = '${proxyDomain}';
+  const targetOrigin = '${targetUrl.origin}';
+  
+  function rewriteApiUrl(url) {
+    try {
+      const urlObj = new URL(url, window.location.href);
+      if (urlObj.origin === targetOrigin || urlObj.hostname === '${targetUrl.hostname}') {
+        const proxySubdomain = urlObj.hostname.replace(/\\\\./g, '--');
+        urlObj.hostname = proxySubdomain + '.' + proxyDomain;
+        urlObj.protocol = 'https:';
+        return urlObj.toString();
+      }
+    } catch (e) {}
+    return url;
+  }
+  
+  // 重写 fetch
+  window.fetch = function(url, ...args) {
+    return originalFetch.call(this, rewriteApiUrl(url), ...args);
+  };
+  
+  // 重写 XMLHttpRequest
+  const originalXhrOpen = XMLHttpRequest.prototype.open;
+  XMLHttpRequest.prototype.open = function(method, url, ...args) {
+    return originalXhrOpen.call(this, method, rewriteApiUrl(url), ...args);
+  };
+})();
+`;
+  
+  // 在适当的位置注入代码
+  if (js.includes('<script>') || js.includes('</head>')) {
+    // 如果是HTML中的脚本，在合适位置注入
+    js = js.replace(/(<script[^>]*>)/i, `$1\
+${injectionCode}\
+`);
+  } else {
+    // 如果是独立的JS文件，在开头注入
+    js = injectionCode + '\
+' + js;
+  }
+  
+  return js;
+}
+
+/**
+ * 重写JSON内容
+ * @param {string} json - JSON内容
+ * @param {URL} targetUrl - 目标URL
+ * @param {string} proxyDomain - 代理域名
+ * @returns {string} - 重写后的JSON
+ */
+function rewriteJson(json, targetUrl, proxyDomain) {
+  try {
+    const data = JSON.parse(json);
+    const rewrittenData = rewriteJsonObject(data, targetUrl, proxyDomain);
+    return JSON.stringify(rewrittenData);
+  } catch (e) {
+    // 如果解析失败，返回原始内容
+    return json;
+  }
+}
+
+/**
+ * 递归重写JSON对象中的URL
+ * @param {any} obj - JSON对象
+ * @param {URL} targetUrl - 目标URL
+ * @param {string} proxyDomain - 代理域名
+ * @returns {any} - 重写后的对象
+ */
+function rewriteJsonObject(obj, targetUrl, proxyDomain) {
+  if (typeof obj === 'string') {
+    // 修正正则表达式，匹配以 http:// 或 https:// 开头的字符串
+    if (/^https?:\/\//.test(obj)) {
+      return rewriteUrl(obj, targetUrl, proxyDomain);
+    }
+    return obj;
+  } else if (Array.isArray(obj)) {
+    return obj.map(item => rewriteJsonObject(item, targetUrl, proxyDomain));
+  } else if (obj && typeof obj === 'object') {
+    const result = {};
+    for (const key in obj) {
+      if (obj.hasOwnProperty(key)) {
+        result[key] = rewriteJsonObject(obj[key], targetUrl, proxyDomain);
+      }
+    }
+    return result;
+  }
+  // 其他类型直接返回
+  return obj;
+}
+
+/**
+ * 通用内容重写
+ * @param {string} content - 内容
+ * @param {URL} targetUrl - 目标URL
+ * @param {string} proxyDomain - 代理域名
+ * @returns {string} - 重写后的内容
+ */
+function rewriteGeneric(content, targetUrl, proxyDomain) {
+  // 替换所有匹配目标域名的URL
+  const targetDomainRegex = new RegExp(
+    `(https?://)([a-zA-Z0-9.-]*\\\\.)?${escapeRegExp(targetUrl.hostname)}`,
+    'gi'
+  );
+  
+  return content.replace(targetDomainRegex, (match, protocol, subdomain) => {
+    const fullDomain = (subdomain || '') + targetUrl.hostname;
+    const proxySubdomain = fullDomain.replace(/\\./g, '--');
+    return `https://${proxySubdomain}.${proxyDomain}`;
+  });
+}
+
+/**
+ * 重写单个URL
+ * @param {string} url - 原始URL
+ * @param {URL} targetUrl - 目标URL
+ * @param {string} proxyDomain - 代理域名
+ * @returns {string} - 重写后的URL
+ */
+function rewriteUrl(url, targetUrl, proxyDomain) {
+  if (!url || url.startsWith('data:') || url.startsWith('blob:') || url.startsWith('#')) {
+    return url;
+  }
+  
+  try {
+    // 处理相对URL
+    const absoluteUrl = new URL(url, targetUrl.origin);
+    
+    // 检查是否需要代理
+    if (shouldProxyUrl(absoluteUrl, targetUrl)) {
+      const proxySubdomain = absoluteUrl.hostname.replace(/\\./g, '--');
+      absoluteUrl.hostname = `${proxySubdomain}.${proxyDomain}`;
+      absoluteUrl.protocol = 'https:';
+      return absoluteUrl.toString();
+    }
+    
+    return url;
+  } catch (e) {
+    // 如果URL解析失败，返回原始值
+    return url;
+  }
+}
+
+/**
+ * 判断URL是否需要代理
+ * @param {URL} url - URL对象
+ * @param {URL} targetUrl - 目标URL
+ * @returns {boolean} - 是否需要代理
+ */
+function shouldProxyUrl(url, targetUrl) {
+  // 同源URL需要代理
+  if (url.hostname === targetUrl.hostname) {
+    return true;
+  }
+  
+  // 子域名需要代理
+  if (url.hostname.endsWith('.' + targetUrl.hostname)) {
+    return true;
+  }
+  
+  // 常见的CDN域名（可根据需要扩展）
+  const commonCdnPatterns = [
+    /\\.cloudflare\\.com$/,
+    /\\.googleapis\\.com$/,
+    /\\.gstatic\\.com$/,
+    /\\.jsdelivr\\.net$/,
+    /\\.unpkg\\.com$/
+  ];
+  
+  // 一般不代理CDN资源，除非特别需要
+  for (const pattern of commonCdnPatterns) {
+    if (pattern.test(url.hostname)) {
+      return false;
+    }
+  }
+  
+  // 其他同源资源
+  return false;
+}
+
+/**
+ * 重写内联脚本
+ * @param {string} html - HTML内容
+ * @param {URL} targetUrl - 目标URL
+ * @param {string} proxyDomain - 代理域名
+ * @returns {string} - 重写后的HTML
+ */
+function rewriteInlineScripts(html, targetUrl, proxyDomain) {
+  // 处理内联脚本标签
+  return html.replace(/<script([^>]*)>([\s\S]*?)<\/script>/gi, (match, attrs, content) => {
+    // 跳过外部脚本
+    if (/\ssrc\s*=/i.test(attrs)) {
+      return match;
+    }
+    
+    // 重写脚本内容
+    const rewrittenContent = rewriteJavaScript(content, targetUrl, proxyDomain);
+    return `<script${attrs}>${rewrittenContent}</script>`;
+  });
+}
+
+/**
+ * 转义正则表达式特殊字符
+ * @param {string} string - 输入字符串
+ * @returns {string} - 转义后的字符串
+ */
+function escapeRegExp(string) {
+  return string.replace(/[.*+?^${}()|[\\]\\\\]/g, '\\\\$&');
+}
+
+/**
+ * 清理响应头
+ * @param {Headers} headers - 响应头
+ */
+function cleanResponseHeaders(headers) {
+  const headersToRemove = [
+    'server',
+    'x-powered-by',
+    'x-aspnet-version',
+    'x-runtime',
+    'x-version',
+    'content-security-policy',
+    'x-frame-options',
+    'x-content-type-options'
+  ];
+  
+  headersToRemove.forEach(header => {
+    headers.delete(header);
+  });
+}
+
+/**
  * 处理前端页面请求
  * @param {Request} request - 原始请求对象
  * @returns {Promise<Response>} - 前端页面响应
@@ -116,27 +614,23 @@ async function handleRequest(request) {
 function handleProxyPage(request) {
   const url = new URL(request.url);
   
-  // 处理API请求
   if (url.pathname === '/api/generate') {
     return handleGenerateApi(request);
   }
   
-  // 返回前端页面
-  // @ts-ignore
-  return new Response(getProxyPageHTML(url.hostname), {
+  return Promise.resolve(new Response(getProxyPageHTML(url.hostname), {
     headers: {
       'Content-Type': 'text/html; charset=utf-8',
       'Cache-Control': 'public, max-age=3600',
-      // 添加安全头部
       'X-Content-Type-Options': 'nosniff',
       'X-Frame-Options': 'DENY',
       'X-XSS-Protection': '1; mode=block'
     }
-  });
+  }));
 }
 
 /**
- * 处理生成代理链接的API请求 - 优化URL处理
+ * 处理生成代理链接的API请求
  * @param {Request} request - 原始请求对象
  * @returns {Promise<Response>} - API响应
  */
@@ -153,10 +647,8 @@ async function handleGenerateApi(request) {
       return createErrorResponse('URL is required', 400);
     }
     
-    // 智能URL处理 - 自动添加协议
     targetUrl = normalizeUrl(targetUrl);
     
-    // 验证URL格式
     let parsedUrl;
     try {
       parsedUrl = new URL(targetUrl);
@@ -164,17 +656,14 @@ async function handleGenerateApi(request) {
       return createErrorResponse('Invalid URL format', 400);
     }
     
-    // 只支持HTTP和HTTPS
     if (!['http:', 'https:'].includes(parsedUrl.protocol)) {
       return createErrorResponse('Only HTTP and HTTPS URLs are supported', 400);
     }
     
-    // 安全检查 - 防止访问内网地址
     if (!isPublicUrl(parsedUrl)) {
       return createErrorResponse('Private network URLs are not allowed', 403);
     }
     
-    // 转换域名为代理格式
     const proxySubdomain = convertUrlToSubdomain(parsedUrl.hostname);
     const originalUrl = new URL(request.url);
     const proxyDomain = originalUrl.hostname.split('.').slice(1).join('.');
