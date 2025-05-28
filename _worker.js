@@ -1,23 +1,59 @@
 /**
- * Cloudflare Worker 反向代理服务
- * 功能：将 aaa-bb-com.yourdomain.com 的请求代理到 aaa.bb.com
+ * Cloudflare Worker 反向代理服务 - 优化版
+ * 功能：将 aaa--bb--com.yourdomain.com 的请求代理到 aaa.bb.com
  * 当访问 proxy.yourdomain.com 时显示前端页面
+ * 优化：完全隐藏源IP，智能URL处理
  */
 
 // 配置常量
 const CONFIG = {
-  REQUEST_TIMEOUT: 30000, // 30秒超时
-  MAX_REDIRECTS: 5,
+  REQUEST_TIMEOUT: 45000, // 30秒超时
+  MAX_REDIRECTS: 45,
   CORS_MAX_AGE: '86400',
   ALLOWED_METHODS: ['GET', 'POST', 'PUT', 'DELETE', 'PATCH', 'HEAD', 'OPTIONS'],
+  
+  // 扩展的敏感头部列表 - 防止IP泄露
   BLOCKED_HEADERS: [
+    // Cloudflare 特定头部
     'cf-connecting-ip',
     'cf-ipcountry', 
     'cf-ray',
     'cf-visitor',
+    'cf-request-id',
+    'cf-warp-tag-id',
+    'cf-worker',
+    
+    // 代理和转发头部
     'x-forwarded-proto',
     'x-forwarded-for',
-    'x-real-ip'
+    'x-forwarded-host',
+    'x-forwarded-port',
+    'x-real-ip',
+    'x-original-forwarded-for',
+    'x-cluster-client-ip',
+    'x-forwarded',
+    'forwarded-for',
+    'forwarded',
+    
+    // 其他可能暴露信息的头部
+    'via',
+    'x-proxy-authorization',
+    'proxy-authorization',
+    'proxy-connection',
+    'true-client-ip',
+    'x-client-ip',
+    'client-ip',
+    'x-originating-ip',
+    'x-remote-ip',
+    'x-remote-addr',
+    'remote-addr'
+  ],
+  
+  // 需要重写的头部
+  REWRITE_HEADERS: [
+    'origin',
+    'referer',
+    'host'
   ]
 };
 
@@ -90,13 +126,17 @@ function handleProxyPage(request) {
   return new Response(getProxyPageHTML(url.hostname), {
     headers: {
       'Content-Type': 'text/html; charset=utf-8',
-      'Cache-Control': 'public, max-age=3600'
+      'Cache-Control': 'public, max-age=3600',
+      // 添加安全头部
+      'X-Content-Type-Options': 'nosniff',
+      'X-Frame-Options': 'DENY',
+      'X-XSS-Protection': '1; mode=block'
     }
   });
 }
 
 /**
- * 处理生成代理链接的API请求
+ * 处理生成代理链接的API请求 - 优化URL处理
  * @param {Request} request - 原始请求对象
  * @returns {Promise<Response>} - API响应
  */
@@ -107,11 +147,14 @@ async function handleGenerateApi(request) {
   
   try {
     const body = await request.json();
-    const targetUrl = body.url;
+    let targetUrl = body.url;
     
     if (!targetUrl) {
       return createErrorResponse('URL is required', 400);
     }
+    
+    // 智能URL处理 - 自动添加协议
+    targetUrl = normalizeUrl(targetUrl);
     
     // 验证URL格式
     let parsedUrl;
@@ -124,6 +167,11 @@ async function handleGenerateApi(request) {
     // 只支持HTTP和HTTPS
     if (!['http:', 'https:'].includes(parsedUrl.protocol)) {
       return createErrorResponse('Only HTTP and HTTPS URLs are supported', 400);
+    }
+    
+    // 安全检查 - 防止访问内网地址
+    if (!isPublicUrl(parsedUrl)) {
+      return createErrorResponse('Private network URLs are not allowed', 403);
     }
     
     // 转换域名为代理格式
@@ -150,7 +198,430 @@ async function handleGenerateApi(request) {
 }
 
 /**
- * 生成前端页面HTML
+ * 智能URL标准化处理
+ * @param {string} url - 用户输入的URL
+ * @returns {string} - 标准化后的URL
+ */
+function normalizeUrl(url) {
+  if (!url || typeof url !== 'string') {
+    throw new Error('Invalid URL');
+  }
+  
+  // 去除首尾空白
+  url = url.trim();
+  
+  // 如果已经有协议，直接返回
+  if (url.match(/^https?:\/\//i)) {
+    return url;
+  }
+  
+  // 如果以 // 开头，添加 https:
+  if (url.startsWith('//')) {
+    return 'https:' + url;
+  }
+  
+  // 如果没有协议，默认添加 https://
+  return 'https://' + url;
+}
+
+/**
+ * 检查URL是否为公网地址（安全检查）
+ * @param {URL} url - URL对象
+ * @returns {boolean} - 是否为公网地址
+ */
+function isPublicUrl(url) {
+  const hostname = url.hostname.toLowerCase();
+  
+  // 检查是否为IP地址
+  const ipv4Regex = /^(\d{1,3}\.){3}\d{1,3}$/;
+  if (ipv4Regex.test(hostname)) {
+    const parts = hostname.split('.').map(Number);
+    
+    // 检查私有IP段
+    if (
+      (parts[0] === 10) || // 10.0.0.0/8
+      (parts[0] === 172 && parts[1] >= 16 && parts[1] <= 31) || // 172.16.0.0/12
+      (parts[0] === 192 && parts[1] === 168) || // 192.168.0.0/16
+      (parts[0] === 127) || // 127.0.0.0/8 (localhost)
+      (parts[0] === 169 && parts[1] === 254) // 169.254.0.0/16 (link-local)
+    ) {
+      return false;
+    }
+  }
+  
+  // 检查本地域名
+  const localDomains = ['localhost', '127.0.0.1', '::1'];
+  if (localDomains.includes(hostname)) {
+    return false;
+  }
+  
+  return true;
+}
+
+/**
+ * 执行代理请求 - 优化IP隐藏
+ * @param {Request} originalRequest - 原始请求
+ * @param {URL} targetUrl - 目标URL
+ * @returns {Promise<Response>} - 代理响应
+ */
+async function proxyRequest(originalRequest, targetUrl) {
+  // 准备请求选项
+  const requestOptions = {
+    method: originalRequest.method,
+    headers: cleanRequestHeaders(originalRequest.headers, targetUrl),
+    redirect: 'manual',
+    signal: AbortSignal.timeout(CONFIG.REQUEST_TIMEOUT)
+  };
+  
+  // 处理请求体
+  if (!['GET', 'HEAD'].includes(originalRequest.method)) {
+    requestOptions.body = originalRequest.body;
+  }
+  
+  try {
+    const response = await fetch(targetUrl.toString(), requestOptions);
+    
+    // 处理重定向
+    if (response.status >= 300 && response.status < 400) {
+      return handleRedirect(response, originalRequest);
+    }
+    
+    return createProxyResponse(response);
+    
+  } catch (error) {
+    if (error.name === 'TimeoutError') {
+      return createErrorResponse('Request timeout', 504);
+    }
+    throw error;
+  }
+}
+
+/**
+ * 清理请求头 - 完全隐藏源IP
+ * @param {Headers} originalHeaders - 原始请求头
+ * @param {URL} targetUrl - 目标URL
+ * @returns {Headers} - 清理后的请求头
+ */
+function cleanRequestHeaders(originalHeaders, targetUrl) {
+  const cleanedHeaders = new Headers();
+  
+  // 复制允许的请求头
+  for (const [key, value] of originalHeaders.entries()) {
+    const lowerKey = key.toLowerCase();
+    if (!CONFIG.BLOCKED_HEADERS.includes(lowerKey)) {
+      cleanedHeaders.set(key, value);
+    }
+  }
+  
+  // 设置正确的目标服务器信息
+  cleanedHeaders.set('Host', targetUrl.hostname);
+  
+  // 重写Origin头部
+  if (originalHeaders.has('Origin')) {
+    cleanedHeaders.set('Origin', targetUrl.origin);
+  }
+  
+  // 重写Referer头部
+  if (originalHeaders.has('Referer')) {
+    const referer = originalHeaders.get('Referer');
+    try {
+      const refererUrl = new URL(referer);
+      refererUrl.hostname = targetUrl.hostname;
+      refererUrl.protocol = targetUrl.protocol;
+      cleanedHeaders.set('Referer', refererUrl.toString());
+    } catch (e) {
+      cleanedHeaders.delete('Referer');
+    }
+  }
+  
+  // 添加一些标准头部以模拟正常请求
+  if (!cleanedHeaders.has('User-Agent')) {
+    cleanedHeaders.set('User-Agent', 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36');
+  }
+  
+  // 设置Accept头部
+  if (!cleanedHeaders.has('Accept')) {
+    cleanedHeaders.set('Accept', 'text/html,application/xhtml+xml,application/xml;q=0.9,image/webp,*/*;q=0.8');
+  }
+  
+  // 设置Accept-Language
+  if (!cleanedHeaders.has('Accept-Language')) {
+    cleanedHeaders.set('Accept-Language', 'en-US,en;q=0.5');
+  }
+  
+  // 设置Accept-Encoding
+  if (!cleanedHeaders.has('Accept-Encoding')) {
+    cleanedHeaders.set('Accept-Encoding', 'gzip, deflate, br');
+  }
+  
+  return cleanedHeaders;
+}
+
+/**
+ * 提取并验证子域名
+ * @param {string} hostname - 主机名
+ * @returns {string|null} - 子域名或null
+ */
+function extractSubdomain(hostname) {
+  const parts = hostname.split('.');
+  if (parts.length < 2) return null;
+  
+  const subdomain = parts[0];
+  
+  // 验证子域名格式（允许字母数字和连字符）
+  if (!/^[a-zA-Z0-9-]+$/.test(subdomain)) {
+    return null;
+  }
+  
+  // 验证连字符格式的子域名
+  if (!isValidSubdomainFormat(subdomain)) {
+    return null;
+  }
+  
+  return subdomain;
+}
+
+/**
+ * 验证子域名格式是否符合要求
+ * @param {string} subdomain - 子域名
+ * @returns {boolean} - 是否有效
+ */
+function isValidSubdomainFormat(subdomain) {
+  // 不能以连字符开头或结尾
+  if (subdomain.startsWith('-') || subdomain.endsWith('-')) {
+    return false;
+  }
+  
+  // 分割后至少要有2个部分
+  const parts = subdomain.split('--');
+  if (parts.length < 2) {
+    return false;
+  }
+  
+  // 每个部分都必须有效
+  return parts.every(part => {
+    return part.length > 0 && /^[a-zA-Z0-9-]+$/.test(part) && 
+           !part.startsWith('-') && !part.endsWith('-');
+  });
+}
+
+/**
+ * 构建目标URL
+ * @param {string} subdomain - 子域名（格式：aaa--bb--com）
+ * @param {URL} originalUrl - 原始URL对象
+ * @returns {URL} - 目标URL对象
+ */
+function buildTargetUrl(subdomain, originalUrl) {
+  const targetDomain = convertSubdomainToUrl(subdomain);
+  
+  if (!targetDomain) {
+    throw new Error('Invalid subdomain format');
+  }
+  
+  const targetUrl = new URL(`https://${targetDomain}`);
+  targetUrl.pathname = originalUrl.pathname;
+  targetUrl.search = originalUrl.search;
+  
+  return targetUrl;
+}
+
+/**
+ * 将连字符格式的子域名转换为标准URL格式
+ * @param {string} subdomain - 连字符格式的子域名（如：aaa--bb--com）
+ * @returns {string|null} - 转换后的域名（如：aaa.bb.com）或null
+ */
+function convertSubdomainToUrl(subdomain) {
+  if (!subdomain || typeof subdomain !== 'string') {
+    return null;
+  }
+  
+  subdomain = subdomain.trim();
+  
+  if (!/^[a-zA-Z0-9-]+$/.test(subdomain)) {
+    return null;
+  }
+  
+  const parts = subdomain.split('--');
+  
+  if (parts.length < 2) {
+    return null;
+  }
+  
+  if (parts.some(part => !part || part.length === 0)) {
+    return null;
+  }
+  
+  return parts.join('.');
+}
+
+/**
+ * 将标准URL格式转换回连字符格式
+ * @param {string} hostname - 标准域名（如：aaa.bb.com）
+ * @returns {string|null} - 连字符格式（如：aaa--bb--com）或null
+ */
+function convertUrlToSubdomain(hostname) {
+  if (!hostname || typeof hostname !== 'string') {
+    return null;
+  }
+  
+  if (!/^[a-zA-Z0-9.-]+$/.test(hostname)) {
+    return null;
+  }
+  
+  return hostname.replace(/\./g, '--');
+}
+
+/**
+ * 创建代理响应 - 移除可能暴露信息的头部
+ * @param {Response} originalResponse - 原始响应
+ * @returns {Response} - 处理后的响应
+ */
+function createProxyResponse(originalResponse) {
+  const response = new Response(originalResponse.body, {
+    status: originalResponse.status,
+    statusText: originalResponse.statusText,
+    headers: originalResponse.headers
+  });
+  
+  // 添加CORS头
+  addCorsHeaders(response.headers);
+  
+  // 移除可能暴露服务器信息的头部
+  const headersToRemove = [
+    'server',
+    'x-powered-by',
+    'x-aspnet-version',
+    'x-runtime',
+    'x-version',
+    'content-security-policy',
+    'x-frame-options',
+    'x-content-type-options'
+  ];
+  
+  headersToRemove.forEach(header => {
+    response.headers.delete(header);
+  });
+  
+  return response;
+}
+
+/**
+ * 处理重定向
+ * @param {Response} response - 重定向响应
+ * @param {Request} originalRequest - 原始请求
+ * @returns {Response} - 处理后的响应
+ */
+function handleRedirect(response, originalRequest) {
+  const location = response.headers.get('Location');
+  if (!location) {
+    return createProxyResponse(response);
+  }
+  
+  try {
+    const redirectUrl = new URL(location);
+    const originalUrl = new URL(originalRequest.url);
+    
+    if (isStandardDomain(redirectUrl.hostname)) {
+      const convertedSubdomain = convertUrlToSubdomain(redirectUrl.hostname);
+      if (convertedSubdomain) {
+        const originalHostParts = originalUrl.hostname.split('.');
+        const proxyDomain = originalHostParts.slice(1).join('.');
+        redirectUrl.hostname = `${convertedSubdomain}.${proxyDomain}`;
+        
+        const redirectResponse = new Response(response.body, {
+          status: response.status,
+          statusText: response.statusText,
+          headers: response.headers
+        });
+        
+        redirectResponse.headers.set('Location', redirectUrl.toString());
+        addCorsHeaders(redirectResponse.headers);
+        
+        return redirectResponse;
+      }
+    }
+  } catch (e) {
+    console.error('Redirect handling error:', e);
+  }
+  
+  return createProxyResponse(response);
+}
+
+/**
+ * 检查是否为标准域名格式
+ * @param {string} hostname - 主机名
+ * @returns {boolean} - 是否为标准域名
+ */
+function isStandardDomain(hostname) {
+  return /^[a-zA-Z0-9.-]+\.[a-zA-Z]{2,}$/.test(hostname) && 
+         hostname.includes('.') &&
+         !hostname.includes('--');
+}
+
+/**
+ * 处理 OPTIONS 预检请求
+ * @param {Request} request - 原始请求
+ * @returns {Response} - OPTIONS响应
+ */
+function handleOptions(request) {
+  const headers = new Headers();
+  addCorsHeaders(headers);
+  
+  const requestHeaders = request.headers.get('Access-Control-Request-Headers');
+  if (requestHeaders) {
+    headers.set('Access-Control-Allow-Headers', requestHeaders);
+  }
+  
+  const requestMethod = request.headers.get('Access-Control-Request-Method');
+  if (requestMethod && CONFIG.ALLOWED_METHODS.includes(requestMethod)) {
+    headers.set('Access-Control-Allow-Methods', CONFIG.ALLOWED_METHODS.join(', '));
+  }
+  
+  return new Response(null, {
+    status: 204,
+    headers: headers
+  });
+}
+
+/**
+ * 添加CORS头
+ * @param {Headers} headers - 响应头对象
+ */
+function addCorsHeaders(headers) {
+  headers.set('Access-Control-Allow-Origin', '*');
+  headers.set('Access-Control-Allow-Methods', CONFIG.ALLOWED_METHODS.join(', '));
+  headers.set('Access-Control-Allow-Headers', 'Content-Type, Authorization, X-Requested-With, Accept, Origin');
+  headers.set('Access-Control-Max-Age', CONFIG.CORS_MAX_AGE);
+  headers.set('Access-Control-Expose-Headers', 'Content-Length, Content-Type');
+}
+
+/**
+ * 创建错误响应
+ * @param {string} message - 错误消息
+ * @param {number} status - HTTP状态码
+ * @returns {Response} - 错误响应
+ */
+function createErrorResponse(message, status = 500) {
+  const errorBody = JSON.stringify({
+    error: message,
+    status: status,
+    timestamp: new Date().toISOString()
+  });
+  
+  const headers = new Headers({
+    'Content-Type': 'application/json; charset=utf-8'
+  });
+  
+  addCorsHeaders(headers);
+  
+  return new Response(errorBody, {
+    status: status,
+    headers: headers
+  });
+}
+
+/**
+ * 生成前端页面HTML - 优化用户体验
  * @param {string} hostname - 当前主机名
  * @returns {string} - HTML内容
  */
@@ -253,6 +724,16 @@ function getProxyPageHTML(hostname) {
             border-color: #667eea;
             background: white;
             box-shadow: 0 0 0 3px rgba(102, 126, 234, 0.1);
+        }
+        
+        .url-hint {
+            font-size: 0.9rem;
+            color: #666;
+            margin-top: 8px;
+            padding: 8px 12px;
+            background: #f0f8ff;
+            border-radius: 8px;
+            border-left: 3px solid #667eea;
         }
         
         .btn {
@@ -484,13 +965,16 @@ function getProxyPageHTML(hostname) {
                 <label for="url">请输入要代理的网址：</label>
                 <div class="input-container">
                     <input 
-                        type="url" 
+                        type="text" 
                         id="url" 
                         name="url" 
-                        placeholder="例如：https://www.youtube.com" 
+                        placeholder="youtube.com 或 https://www.youtube.com" 
                         required
                         autocomplete="url"
                     >
+                </div>
+                <div class="url-hint">
+                    💡 提示：可以直接输入域名，系统会自动添加 https:// 协议
                 </div>
             </div>
             
@@ -524,9 +1008,10 @@ function getProxyPageHTML(hostname) {
         <div class="examples">
             <h3>📝 使用示例</h3>
             <ul>
-                <li>输入 youtube.com → 生成 youtube-com.${domain}</li>
-                <li>输入 github.com → 生成 github-com.${domain}</li>
-                <li>输入 api.github.com → 生成 api-github-com.${domain}</li>
+                <li>输入 youtube.com → 生成 youtube--com.${domain}</li>
+                <li>输入 github.com → 生成 github--com.${domain}</li>
+                <li>输入 api.github.com → 生成 api--github--com.${domain}</li>
+                <li>输入 www.example.com → 生成 www--example--com.${domain}</li>
             </ul>
         </div>
     </div>
@@ -549,12 +1034,6 @@ function getProxyPageHTML(hostname) {
             const url = document.getElementById('url').value.trim();
             if (!url) return;
             
-            // 确保URL有协议
-            let fullUrl = url;
-            if (!url.startsWith('http://') && !url.startsWith('https://')) {
-                fullUrl = 'https://' + url;
-            }
-            
             // 显示加载状态
             showLoading();
             hideResult();
@@ -566,7 +1045,7 @@ function getProxyPageHTML(hostname) {
                     headers: {
                         'Content-Type': 'application/json'
                     },
-                    body: JSON.stringify({ url: fullUrl })
+                    body: JSON.stringify({ url: url })
                 });
                 
                 const data = await response.json();
@@ -707,382 +1186,4 @@ function getProxyPageHTML(hostname) {
     </script>
 </body>
 </html>`;
-}
-
-
-/**
- * 提取并验证子域名
- * @param {string} hostname - 主机名
- * @returns {string|null} - 子域名或null
- */
-function extractSubdomain(hostname) {
-  const parts = hostname.split('.');
-  if (parts.length < 2) return null;
-  
-  const subdomain = parts[0];
-  
-  // 验证子域名格式（允许字母数字和连字符）
-  if (!/^[a-zA-Z0-9-]+$/.test(subdomain)) {
-    return null;
-  }
-  
-  // 验证连字符格式的子域名
-  if (!isValidSubdomainFormat(subdomain)) {
-    return null;
-  }
-  
-  return subdomain;
-}
-
-/**
- * 验证子域名格式是否符合要求
- * @param {string} subdomain - 子域名
- * @returns {boolean} - 是否有效
- */
-function isValidSubdomainFormat(subdomain) {
-  // 不能以连字符开头或结尾
-  if (subdomain.startsWith('-') || subdomain.endsWith('-')) {
-    return false;
-  }
-  
-  
-  // 分割后至少要有2个部分（修改为2个部分）
-  const parts = subdomain.split('--');
-  if (parts.length < 2) {
-    return false;
-  }
-  
-  // 每个部分都必须有效
-  return parts.every(part => {
-    return part.length > 0 && /^[a-zA-Z0-9-]+$/.test(part);
-  });
-}
-
-/**
- * 构建目标URL
- * @param {string} subdomain - 子域名（格式：aaa-bb-com）
- * @param {URL} originalUrl - 原始URL对象
- * @returns {URL} - 目标URL对象
- */
-function buildTargetUrl(subdomain, originalUrl) {
-  // 将连字符格式转换为点分格式
-  const targetDomain = convertSubdomainToUrl(subdomain);
-  
-  if (!targetDomain) {
-    throw new Error('Invalid subdomain format');
-  }
-  
-  const targetUrl = new URL(`https://${targetDomain}`);
-  targetUrl.pathname = originalUrl.pathname;
-  targetUrl.search = originalUrl.search;
-  
-  return targetUrl;
-}
-
-/**
- * 将连字符格式的子域名转换为标准URL格式
- * @param {string} subdomain - 连字符格式的子域名（如：aaa-bb-com）
- * @returns {string|null} - 转换后的域名（如：aaa.bb.com）或null（如果格式无效）
- */
-function convertSubdomainToUrl(subdomain) {
-  if (!subdomain || typeof subdomain !== 'string') {
-    return null;
-  }
-  
-  // 移除首尾空白字符
-  subdomain = subdomain.trim();
-  
-  // 验证基本格式：只允许字母、数字和连字符
-  if (!/^[a-zA-Z0-9-]+$/.test(subdomain)) {
-    return null;
-  }
-  
-  // 分割连字符
-  const parts = subdomain.split('--');
-  
-  // 至少需要2个部分才能构成有效的域名（修改为2个部分）
-  if (parts.length < 2) {
-    return null;
-  }
-  
-  // 验证每个部分都不为空
-  if (parts.some(part => !part || part.length === 0)) {
-    return null;
-  }
-  
-  // 将连字符替换为点号
-  return parts.join('.');
-}
-
-/**
- * 执行代理请求
- * @param {Request} originalRequest - 原始请求
- * @param {URL} targetUrl - 目标URL
- * @returns {Promise<Response>} - 代理响应
- */
-async function proxyRequest(originalRequest, targetUrl) {
-  // 准备请求选项
-  const requestOptions = {
-    method: originalRequest.method,
-    headers: cleanRequestHeaders(originalRequest.headers, targetUrl),
-    redirect: 'manual', // 手动处理重定向以避免循环
-    // 添加超时控制
-    signal: AbortSignal.timeout(CONFIG.REQUEST_TIMEOUT)
-  };
-  
-  // 处理请求体（GET和HEAD请求不应该有body）
-  if (!['GET', 'HEAD'].includes(originalRequest.method)) {
-    requestOptions.body = originalRequest.body;
-  }
-  
-  try {
-    const response = await fetch(targetUrl.toString(), requestOptions);
-    
-    // 处理重定向
-    if (response.status >= 300 && response.status < 400) {
-      return handleRedirect(response, originalRequest);
-    }
-    
-    return createProxyResponse(response);
-    
-  } catch (error) {
-    if (error.name === 'TimeoutError') {
-      return createErrorResponse('Request timeout', 504);
-    }
-    throw error;
-  }
-}
-
-/**
- * 清理请求头
- * @param {Headers} originalHeaders - 原始请求头
- * @param {URL} targetUrl - 目标URL
- * @returns {Headers} - 清理后的请求头
- */
-function cleanRequestHeaders(originalHeaders, targetUrl) {
-  const cleanedHeaders = new Headers();
-  
-  // 复制允许的请求头
-  for (const [key, value] of originalHeaders.entries()) {
-    const lowerKey = key.toLowerCase();
-    if (!CONFIG.BLOCKED_HEADERS.includes(lowerKey)) {
-      cleanedHeaders.set(key, value);
-    }
-  }
-  
-  // 设置正确的目标服务器信息
-  cleanedHeaders.set('Host', targetUrl.hostname);
-  
-  // 清除所有可能暴露真实IP的头部
-  cleanedHeaders.delete('CF-Connecting-IP');
-  cleanedHeaders.delete('CF-IPCountry');
-  cleanedHeaders.delete('CF-Ray');
-  cleanedHeaders.delete('CF-Visitor');
-  cleanedHeaders.delete('X-Forwarded-Proto');
-  cleanedHeaders.delete('X-Forwarded-For');
-  cleanedHeaders.delete('X-Real-IP');
-  cleanedHeaders.delete('X-Forwarded-Host');
-  cleanedHeaders.delete('X-Original-Host');
-  cleanedHeaders.delete('Forwarded');
-  cleanedHeaders.delete('True-Client-IP');
-  cleanedHeaders.delete('X-Client-IP');
-  cleanedHeaders.delete('X-Cluster-Client-IP');
-  
-  // 设置通用的用户代理，避免暴露Worker特征
-  if (!cleanedHeaders.has('User-Agent')) {
-    cleanedHeaders.set('User-Agent', 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36');
-  }
-  
-  // 如果原始请求有 Origin，则更新为目标域名
-  if (originalHeaders.has('Origin')) {
-    cleanedHeaders.set('Origin', targetUrl.origin);
-  }
-  
-  // 如果原始请求有 Referer，则更新为目标域名
-  if (originalHeaders.has('Referer')) {
-    const referer = originalHeaders.get('Referer');
-    try {
-      const refererUrl = new URL(referer);
-      refererUrl.hostname = targetUrl.hostname;
-      cleanedHeaders.set('Referer', refererUrl.toString());
-    } catch (e) {
-      // 如果 Referer 格式不正确，则删除它
-      cleanedHeaders.delete('Referer');
-    }
-  }
-  
-  // 设置接受编码，优化传输
-  if (!cleanedHeaders.has('Accept-Encoding')) {
-    cleanedHeaders.set('Accept-Encoding', 'gzip, deflate, br');
-  }
-  
-  // 设置连接类型
-  cleanedHeaders.set('Connection', 'keep-alive');
-  
-  // 移除可能导致问题的缓存控制头（让目标服务器决定）
-  cleanedHeaders.delete('Cache-Control');
-  cleanedHeaders.delete('Pragma');
-  
-  return cleanedHeaders;
-}
-
-/**
- * 创建代理响应
- * @param {Response} originalResponse - 原始响应
- * @returns {Response} - 处理后的响应
- */
-function createProxyResponse(originalResponse) {
-  // 创建新的响应对象
-  const response = new Response(originalResponse.body, {
-    status: originalResponse.status,
-    statusText: originalResponse.statusText,
-    headers: originalResponse.headers
-  });
-  
-  // 添加CORS头
-  addCorsHeaders(response.headers);
-  
-  // 移除可能导致问题的安全头
-  response.headers.delete('Content-Security-Policy');
-  response.headers.delete('X-Frame-Options');
-  
-  return response;
-}
-
-/**
- * 处理重定向
- * @param {Response} response - 重定向响应
- * @param {Request} originalRequest - 原始请求
- * @returns {Response} - 处理后的响应
- */
-function handleRedirect(response, originalRequest) {
-  const location = response.headers.get('Location');
-  if (!location) {
-    return createProxyResponse(response);
-  }
-  
-  try {
-    const redirectUrl = new URL(location);
-    const originalUrl = new URL(originalRequest.url);
-    
-    // 如果重定向的URL是标准域名格式，需要转换回代理格式
-    if (isStandardDomain(redirectUrl.hostname)) {
-      const convertedSubdomain = convertUrlToSubdomain(redirectUrl.hostname);
-      if (convertedSubdomain) {
-        // 构建代理域名
-        const originalHostParts = originalUrl.hostname.split('.');
-        const proxyDomain = originalHostParts.slice(1).join('.');
-        redirectUrl.hostname = `${convertedSubdomain}.${proxyDomain}`;
-        
-        const redirectResponse = new Response(response.body, {
-          status: response.status,
-          statusText: response.statusText,
-          headers: response.headers
-        });
-        
-        redirectResponse.headers.set('Location', redirectUrl.toString());
-        addCorsHeaders(redirectResponse.headers);
-        
-        return redirectResponse;
-      }
-    }
-  } catch (e) {
-    console.error('Redirect handling error:', e);
-  }
-  
-  return createProxyResponse(response);
-}
-
-/**
- * 检查是否为标准域名格式
- * @param {string} hostname - 主机名
- * @returns {boolean} - 是否为标准域名
- */
-function isStandardDomain(hostname) {
-  // 检查是否为标准域名格式（包含点号的域名）
-  return /^[a-zA-Z0-9.-]+\\.[a-zA-Z]{2,}$/.test(hostname) && 
-         hostname.includes('.') &&
-         !hostname.includes('-');
-}
-
-/**
- * 将标准URL格式转换回连字符格式
- * @param {string} hostname - 标准域名（如：aaa.bb.com）
- * @returns {string|null} - 连字符格式（如：aaa-bb-com）或null
- */
-function convertUrlToSubdomain(hostname) {
-  if (!hostname || typeof hostname !== 'string') {
-    return null;
-  }
-  
-  // 验证域名格式
-  if (!/^[a-zA-Z0-9.-]+$/.test(hostname)) {
-    return null;
-  }
-  
-  // 将点号替换为连字符
-  return hostname.replace(/\./g, '--');
-}
-
-/**
- * 处理 OPTIONS 预检请求
- * @param {Request} request - 原始请求
- * @returns {Response} - OPTIONS响应
- */
-function handleOptions(request) {
-  const headers = new Headers();
-  addCorsHeaders(headers);
-  
-  // 处理预检请求的特定头
-  const requestHeaders = request.headers.get('Access-Control-Request-Headers');
-  if (requestHeaders) {
-    headers.set('Access-Control-Allow-Headers', requestHeaders);
-  }
-  
-  const requestMethod = request.headers.get('Access-Control-Request-Method');
-  if (requestMethod && CONFIG.ALLOWED_METHODS.includes(requestMethod)) {
-    headers.set('Access-Control-Allow-Methods', CONFIG.ALLOWED_METHODS.join(', '));
-  }
-  
-  return new Response(null, {
-    status: 204,
-    headers: headers
-  });
-}
-
-/**
- * 添加CORS头
- * @param {Headers} headers - 响应头对象
- */
-function addCorsHeaders(headers) {
-  headers.set('Access-Control-Allow-Origin', '*');
-  headers.set('Access-Control-Allow-Methods', CONFIG.ALLOWED_METHODS.join(', '));
-  headers.set('Access-Control-Allow-Headers', 'Content-Type, Authorization, X-Requested-With, Accept, Origin');
-  headers.set('Access-Control-Max-Age', CONFIG.CORS_MAX_AGE);
-  headers.set('Access-Control-Expose-Headers', 'Content-Length, Content-Type');
-}
-
-/**
- * 创建错误响应
- * @param {string} message - 错误消息
- * @param {number} status - HTTP状态码
- * @returns {Response} - 错误响应
- */
-function createErrorResponse(message, status = 500) {
-  const errorBody = JSON.stringify({
-    error: message,
-    status: status,
-    timestamp: new Date().toISOString()
-  });
-  
-  const headers = new Headers({
-    'Content-Type': 'application/json; charset=utf-8'
-  });
-  
-  addCorsHeaders(headers);
-  
-  return new Response(errorBody, {
-    status: status,
-    headers: headers
-  });
 }
