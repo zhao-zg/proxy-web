@@ -487,7 +487,7 @@ function getProxyPageHTML(hostname) {
                         type="url" 
                         id="url" 
                         name="url" 
-                        placeholder="例如：https://www.google.com" 
+                        placeholder="例如：https://www.youtube.com" 
                         required
                         autocomplete="url"
                     >
@@ -524,7 +524,7 @@ function getProxyPageHTML(hostname) {
         <div class="examples">
             <h3>📝 使用示例</h3>
             <ul>
-                <li>输入 google.com → 生成 google-com.${domain}</li>
+                <li>输入 youtube.com → 生成 youtube-com.${domain}</li>
                 <li>输入 github.com → 生成 github-com.${domain}</li>
                 <li>输入 api.github.com → 生成 api-github-com.${domain}</li>
             </ul>
